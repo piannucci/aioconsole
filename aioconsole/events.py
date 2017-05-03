@@ -7,69 +7,53 @@ from . import code
 from . import compat
 from . import server
 
+@asyncio.coroutine
+def interactive_console(loop, locals=None, banner=None, serve=None, console_class=code.AsynchronousConsole):
+    # Local console
+    if serve is None:
+        console = console_class(None, locals=locals, loop=loop)
+        yield from console.interact(banner, stop=True, handle_sigint=True)
+    # Serving console
+    else:
+        host, port = serve
+        try:
+            factory = lambda streams: console_class(streams, locals=locals, loop=loop)
+            console_server = yield from server.start_interactive_server(
+                factory, host=host, port=port, banner=banner, loop=loop)
+            server.print_server(console_server)
+        except:
+            pass
 
-class InteractiveEventLoop(asyncio.SelectorEventLoop):
-    """Event loop running a python console."""
-
-    console_class = code.AsynchronousConsole
-
-    def __init__(self, selector=None, locals=None, banner=None, serve=None):
-        self.console = None
-        self.console_task = None
-        self.console_server = None
-        super().__init__(selector=selector)
-        # Factory
-        self.factory = lambda streams: self.console_class(
-            streams, locals=locals, loop=self)
-        # Local console
-        if serve is None:
-            self.console = self.factory(None)
-            coro = self.console.interact(banner, stop=True, handle_sigint=True)
-            self.console_task = asyncio.async(coro, loop=self)
-        # Serving console
-        else:
-            host, port = serve
-            coro = server.start_interactive_server(
-                self.factory, host=host, port=port, banner=banner, loop=self)
-            self.console_server = self.run_until_complete(coro)
-            server.print_server(self.console_server)
-
-    def close(self):
-        if self.console_task and not self.is_running():
-            asyncio.Future.cancel(self.console_task)
-        super().close()
-
-    if compat.PY34:
-        def __del__(self):
-            if self.console_task and self.console_task.done():
-                self.console_task.exception()
-            try:
-                super().__del__()
-            except AttributeError:
-                pass
-
-
-class InteractiveEventLoopPolicy(asyncio.DefaultEventLoopPolicy):
+class InteractiveEventLoopPolicy(asyncio.AbstractEventLoopPolicy):
     """Policy to use the interactive event loop by default."""
 
-    def __init__(self, serve=None):
+    def __init__(self, serve=None, oldpolicy=None):
+        assert oldpolicy is not None
         self.serve = serve
+        self.oldpolicy = oldpolicy
         super().__init__()
 
-    @property
-    def _loop_factory(self):
-        return functools.partial(InteractiveEventLoop, serve=self.serve)
+    def get_event_loop(self):
+        return self.oldpolicy.get_event_loop()
+
+    def set_event_loop(self, loop):
+        self.oldpolicy.set_event_loop(loop)
+
+    def new_event_loop(self):
+        loop = self.oldpolicy.new_event_loop()
+        loop.create_task(interactive_console(loop, locals=None, banner=None, serve=self.serve))
+        return loop
 
 
 def set_interactive_policy(serve=None):
     """Use an interactive event loop by default."""
-    asyncio.set_event_loop_policy(InteractiveEventLoopPolicy(serve))
+    asyncio.set_event_loop_policy(InteractiveEventLoopPolicy(serve, asyncio.get_event_loop_policy()))
 
 
 def run_console(selector=None, locals=None, banner=None, serve=None):
     """Run the interactive event loop."""
-    loop = InteractiveEventLoop(selector, locals, banner, serve)
-    asyncio.set_event_loop(loop)
+    loop = asyncio.get_event_loop()
+    console_task = loop.create_task(interactive_console(loop, locals, banner, serve))
     try:
         loop.run_forever()
     except KeyboardInterrupt:
